@@ -1,0 +1,40 @@
+{
+  "receiver": "rocketchat",
+  "status": "firing",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "ApplicationUnhealthy",
+        "severity": "critical",
+        "instance": "app-42.prod.svc:8080",
+        "job": "myapp-app",
+        "site": "rz1",
+        "federated_from": "",
+        "namespace": "production",
+        "pod": "myapp-7d9c8c9c5b-ksf7t"
+      },
+      "annotations": {
+        "summary": "Application reports unhealthy state",
+        "description": "The health endpoint returned HTTP 500 for more than 2 minutes.",
+        "runbook_url": "https://wiki.company.local/runbooks/app-health"
+      },
+      "startsAt": "2025-01-15T07:32:07.123Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://prometheus-rz1:9090/graph?g0.expr=application_health%3D%3D0"
+    }
+  ],
+  "groupLabels": {
+    "alertname": "ApplicationUnhealthy"
+  },
+  "commonLabels": {
+    "alertname": "ApplicationUnhealthy",
+    "severity": "critical"
+  },
+  "commonAnnotations": {
+    "summary": "Application reports unhealthy state"
+  },
+  "externalURL": "https://alertmanager.rz1.company.com",
+  "version": "4",
+  "groupKey": "{}:{alertname=\"ApplicationUnhealthy\"}"
+}
