@@ -8,40 +8,48 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/go-redis/redis/v8"
 	"github.com/patrickmn/go-cache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gopkg.in/yaml.v3"
 )
 
-// Configuration via env
+// Config: mapping receivers -> list of target webhook URLs
+type ReceiverMap map[string][]string
+
+// Env-config
 var (
-	port                = envOr("PORT", "8080")
-	targetWebhookURL    = envOr("TARGET_WEBHOOK_URL", "")
-	redisURL            = os.Getenv("REDIS_URL")
-	dedupTTLSecondsEnv  = envOr("DEDUP_TTL_SECONDS", "600")
+	portEnv             = envOr("PORT", "8080")
+	dedupTTLEnv         = envOr("DEDUP_TTL_SECONDS", "600")
 	forwardTimeoutMsEnv = envOr("FORWARD_TIMEOUT_MS", "5000")
-	logLevel            = envOr("LOG_LEVEL", "info")
+	redisURLEnv         = os.Getenv("REDIS_URL")
+	receiverMapPath     = envOr("RECEIVER_MAP_PATH", "/config/receivers.yaml")
+	fallbackReceiver    = envOr("FALLBACK_RECEIVER", "")
 )
 
 // Prometheus metrics
 var (
-	forwarded  = prometheus.NewCounter(prometheus.CounterOpts{Name: "rocketguard_forwarded_total", Help: "Forwarded alerts"})
+	forwarded = prometheus.NewCounter(prometheus.CounterOpts{Name: "rocketguard_forwarded_total", Help: "Forwarded alerts"})
 	suppressed = prometheus.NewCounter(prometheus.CounterOpts{Name: "rocketguard_suppressed_total", Help: "Suppressed alerts"})
 	forwardErr = prometheus.NewCounter(prometheus.CounterOpts{Name: "rocketguard_forward_errors_total", Help: "Forward errors"})
 	cacheType  = prometheus.NewGauge(prometheus.GaugeOpts{Name: "rocketguard_cache_type", Help: "0=in-memory,1=redis"})
 )
 
-// Alert types
+// Alert payloads
 type AMPayload struct {
-	Alerts []Alert `json:"alerts"`
+	Receiver string  `json:"receiver"`
+	Alerts   []Alert `json:"alerts"`
 }
 
 type Alert struct {
@@ -53,13 +61,17 @@ type Alert struct {
 	GeneratorURL string            `json:"generatorURL,omitempty"`
 }
 
-// cache/backends
+// Cache/backends
 var (
 	memCache *cache.Cache
 	rdb      *redis.Client
 	useRedis bool
 	httpCli  *http.Client
 	dedupTTL int
+
+	// receiver map + lock for reload
+	receiverMap     = make(ReceiverMap)
+	receiverMapLock sync.RWMutex
 )
 
 func envOr(k, d string) string {
@@ -75,9 +87,9 @@ func init() {
 }
 
 func parseTTL() time.Duration {
-	d, err := time.ParseDuration(dedupTTLSecondsEnv + "s")
+	d, err := time.ParseDuration(dedupTTLEnv + "s")
 	if err != nil {
-		log.Printf("invalid DEDUP_TTL_SECONDS=%s, defaulting to 600s", dedupTTLSecondsEnv)
+		log.Printf("invalid DEDUP_TTL_SECONDS=%s, defaulting to 600s", dedupTTLEnv)
 		return 600 * time.Second
 	}
 	return d
@@ -87,8 +99,8 @@ func initCache(ctx context.Context) {
 	tl := parseTTL()
 	dedupTTL = int(tt.Seconds())
 
-	if redisURL != "" {
-		opt, err := redis.ParseURL(redisURL)
+	if redisURLEnv != "" {
+		opt, err := redis.ParseURL(redisURLEnv)
 		if err != nil {
 			log.Fatalf("invalid REDIS_URL: %v", err)
 		}
@@ -116,7 +128,7 @@ func fingerprint(a *Alert) string {
 		lbl["job"],
 		lbl["instance"],
 		lbl["severity"],
-		a.StartsAt,
+		// omit startsAt to allow dedupe of repeated firings
 	}
 	h := sha256.Sum256([]byte(strings.Join(parts, "|")))
 	return hex.EncodeToString(h[:])
@@ -137,78 +149,125 @@ func setIfNotExists(ctx context.Context, key string, ttlSec int) (bool, error) {
 	return true, nil
 }
 
+// load receiver map from yaml file (simple mapping: receiver: [url1, url2])
+func loadReceiverMap(path string) (ReceiverMap, error) {
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string][]string)
+	if err := yaml.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// watch receiver map file for changes and reload it
+func watchReceiverMap(path string) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("fsnotify.NewWatcher error: %v", err)
+		return
+	}
+	defer w.Close()
+	if err := w.Add(path); err != nil {
+		log.Printf("watch add error: %v", err)
+		return
+	}
+	for {
+		select {
+		case ev, ok := <-w.Events:
+			if !ok { return }
+			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+				log.Printf("receiver map changed, reloading...")
+				if m, err := loadReceiverMap(path); err == nil {
+					receiverMapLock.Lock()
+					receiverMap = m
+					receiverMapLock.Unlock()
+					log.Printf("receiver map reloaded, %d receivers", len(m))
+				} else {
+					log.Printf("failed to reload receiver map: %v", err)
+				}
+			}
+		case err, ok := <-w.Errors:
+			if !ok { return }
+			log.Printf("watcher error: %v", err)
+		}
+	}
+}
+
+func getTargetsForReceiver(receiver string) ([]string, error) {
+	receiverMapLock.RLock()
+	defer receiverMapLock.RUnlock()
+	if targets, ok := receiverMap[receiver]; ok && len(targets) > 0 {
+		return targets, nil
+	}
+	if fallbackReceiver != "" {
+		if targets, ok := receiverMap[fallbackReceiver]; ok && len(targets) > 0 {
+			return targets, nil
+		}
+	}
+	return nil, fmt.Errorf("no targets for receiver %s", receiver)
+}
+
 func buildRocketPayload(alerts []Alert) map[string]interface{} {
 	lines := make([]string, 0, len(alerts))
 	for _, a := range alerts {
 		l := a.Labels
 		ann := a.Annotations
 		sev := l["severity"]
-		if sev == "" {
-			sev = ann["severity"]
-		}
+		if sev == "" { sev = ann["severity"] }
 		title := l["alertname"]
-		if title == "" {
-			title = ann["summary"]
-		}
+		if title == "" { title = ann["summary"] }
 		job := ""
-		if j := l["job"]; j != "" {
-			job = fmt.Sprintf(" job=%s", j)
-		}
+		if j := l["job"]; j != "" { job = fmt.Sprintf(" job=%s", j) }
 		site := ""
-		if s := l["site"]; s != "" {
-			site = fmt.Sprintf(" site=%s", s)
-		}
+		if s := l["site"]; s != "" { site = fmt.Sprintf(" site=%s", s) }
 		inst := ""
-		if i := l["instance"]; i != "" {
-			inst = fmt.Sprintf(" instance=%s", i)
-		}
+		if i := l["instance"]; i != "" { inst = fmt.Sprintf(" instance=%s", i) }
 		desc := ann["description"]
-		if desc == "" {
-			desc = ann["summary"]
-		}
+		if desc == "" { desc = ann["summary"] }
 		lines = append(lines, fmt.Sprintf("*%s* (%s)%s%s%s\n%s", title, sev, job, site, inst, desc))
 	}
 	return map[string]interface{}{"text": strings.Join(lines, "\n\n")}
 }
 
-func forwardToTarget(payload map[string]interface{}) error {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return err
+// fan-out forward to all targets for receiver; returns error if all fail
+func forwardToTargets(payload map[string]interface{}, targets []string) error {
+	b, _ := json.Marshal(payload)
+	var lastErr error
+	for _, t := range targets {
+		req, err := http.NewRequest(http.MethodPost, t, strings.NewReader(string(b)))
+		if err != nil { lastErr = err; continue }
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := httpCli.Do(req)
+		if err != nil { lastErr = err; continue }
+		io.Copy(ioutil.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			// success for this target
+			return nil
+		}
+		lastErr = fmt.Errorf("bad status %d from %s", resp.StatusCode, t)
 	}
-	req, err := http.NewRequest(http.MethodPost, targetWebhookURL, strings.NewReader(string(b)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpCli.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("bad status %d: %s", resp.StatusCode, string(body))
-	}
-	return nil
+	return lastErr
 }
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "only POST", http.StatusMethodNotAllowed)
-		return
-	}
+	if r.Method != http.MethodPost { http.Error(w, "only POST", http.StatusMethodNotAllowed); return }
 	var payload AMPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
-	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, "invalid json", http.StatusBadRequest); return }
 	alerts := payload.Alerts
-	if len(alerts) == 0 {
-		w.WriteHeader(200)
-		w.Write([]byte(`{"status":"no_alerts"}`))
+	if len(alerts) == 0 { w.WriteHeader(200); w.Write([]byte(`{"status":"no_alerts"}`)); return }
+
+	receiver := payload.Receiver
+	targets, err := getTargetsForReceiver(receiver)
+	if err != nil {
+		log.Printf("no targets for receiver %s: %v", receiver, err)
+		http.Error(w, "no target for receiver", http.StatusBadRequest)
 		return
 	}
+
 	ctx := r.Context()
 	toForward := make([]Alert, 0, len(alerts))
 	suppressedCount := 0
@@ -222,60 +281,65 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 			toForward = append(toForward, *a)
 			continue
 		}
-		if ok {
-			toForward = append(toForward, *a)
-		} else {
-			suppressedCount++
-		}
+		if ok { toForward = append(toForward, *a) } else { suppressedCount++ }
 	}
+
 	if len(toForward) == 0 {
 		suppressed.Add(float64(suppressedCount))
 		w.WriteHeader(200)
-		json.NewEncoder(w).Encode(map[string]interface{}{"status": "suppressed", "suppressed": suppressedCount})
+		json.NewEncoder(w).Encode(map[string]interface{}{"status":"suppressed", "suppressed": suppressedCount})
 		return
 	}
+
 	payloadOut := buildRocketPayload(toForward)
-	if err := forwardToTarget(payloadOut); err != nil {
+	if err := forwardToTargets(payloadOut, targets); err != nil {
 		forwardErr.Inc()
 		log.Printf("forward failed: %v", err)
 		http.Error(w, "forward_error", http.StatusBadGateway)
 		return
 	}
+
 	forwarded.Add(float64(len(toForward)))
-	if suppressedCount > 0 {
-		suppressed.Add(float64(suppressedCount))
-	}
+	if suppressedCount > 0 { suppressed.Add(float64(suppressedCount)) }
 	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(map[string]interface{}{"status": "forwarded", "forwarded": len(toForward), "suppressed": suppressedCount})
+	json.NewEncoder(w).Encode(map[string]interface{}{"status":"forwarded", "forwarded": len(toForward), "suppressed": suppressedCount})
 }
 
 func main() {
 	flag.Parse()
-	if targetWebhookURL == "" {
-		log.Fatalf("TARGET_WEBHOOK_URL must be set")
-	}
-	// http client with timeout
+	if receiverMapPath == "" { log.Fatalf("RECEIVER_MAP_PATH must be set") }
+	if dedupTTLEnv == "" { dedupTTLEnv = "600" }
+	if forwardTimeoutMsEnv == "" { forwardTimeoutMsEnv = "5000" }
+
+	// http client
 	to, _ := time.ParseDuration(forwardTimeoutMsEnv + "ms")
 	httpCli = &http.Client{Timeout: to, Transport: &http.Transport{DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}}
 
 	ctx := context.Background()
 	initCache(ctx)
 
+	// load initial receiver map
+	m, err := loadReceiverMap(receiverMapPath)
+	if err != nil {
+		log.Fatalf("failed to load receiver map: %v", err)
+	}
+	receiverMapLock.Lock()
+	receiverMap = m
+	receiverMapLock.Unlock()
+	log.Printf("loaded receiver map (%d receivers)", len(m))
+
+	// watch config for changes
+	go watchReceiverMap(receiverMapPath)
+
 	http.HandleFunc("/webhook", handleWebhook)
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200); w.Write([]byte("ok")) })
 	http.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		if useRedis && rdb == nil {
-			http.Error(w, "redis-not-ready", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(200)
-		w.Write([]byte("ready"))
+		if useRedis && rdb == nil { http.Error(w, "redis-not-ready", http.StatusServiceUnavailable); return }
+		w.WriteHeader(200); w.Write([]byte("ready"))
 	})
 	http.Handle("/metrics", promhttp.Handler())
 
-	addr := ":" + port
-	log.Printf("rocketguard starting on %s -> %s", addr, targetWebhookURL)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatalf("server failed: %v", err)
-	}
+	addr := ":" + portEnv
+	log.Printf("rocketguard starting on %s (TTL=%ds)", addr, dedupTTL)
+	if err := http.ListenAndServe(addr, nil); err != nil { log.Fatalf("server failed: %v", err) }
 }

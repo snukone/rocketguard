@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rocketguard-receivers
+data:
+  receivers.yaml: |
+    rocketchat-critical:
+      - https://chat.company.com/hooks/critical
+    rocketchat-warning:
+      - https://chat.company.com/hooks/warning
+    rocketchat-infra:
+      - https://chat.company.com/hooks/infra
+    rocketchat-dev:
+      - https://chat.company.com/hooks/dev
