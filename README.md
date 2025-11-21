@@ -1,131 +1,173 @@
-# Rocketguard – Alert Dedupe Proxy for Alertmanager → Rocket.Chat
+# Rocketguard – Der Rocket.Chat Alert Dedupe Proxy
 
-Rocketguard ist ein hochperformanter, minimaler Alert-Dedupe-Proxy für
-Multi-Cluster-Umgebungen, in denen mehrere Alertmanager dieselben Alerts senden.
-Der Proxy verhindert Doppelmeldungen durch Fingerprinting & TTL-Cache
-(in-memory oder Redis).
+**Rocketguard** ist ein hochperformanter, minimalistischer Proxy, der doppelte Alerts aus mehreren Alertmanager-Instanzen unterdrückt, bevor sie in **Rocket.Chat** landen. Er wurde speziell für Multi‑Cluster- oder Multi‑RZ‑Umgebungen entwickelt, in denen identische Alerts mehrfach ausgelöst werden können.
 
-Ideal für Umgebungen ohne zentralen Alertmanager, z. B.:
-
-- mehrere Rechenzentren (RZ1, RZ2)
-- identische Prometheus/Alertmanager-Deployments
-- Federation zwischen Clustern
-- deduplizierte Chat-Anbindung (Rocket.Chat, Slack, Teams, Mattermost)
+Rocketguard sorgt dafür, dass in Rocket.Chat **nur ein Alert** erscheint – egal aus welchem Cluster der ursprüngliche Alert stammt.
 
 ---
 
-## ✨ Features
+## 🚀 Features
 
-- 🔥 Deduplizierung identischer Alerts anhand Fingerprint
-- 🧠 dynamische TTL (pro severity/alertname möglich)
-- 🚀 extrem leichtgewichtig (Go, <15 MB Docker Image)
-- 📡 Rocket.Chat kompatibel (andere Webhooks auch)
-- 🎯 Redis oder in-memory Cache
-- 🛡️ optional NetworkPolicy, RBAC, Helm-Chart
-- 🔍 Metriken via `/metrics` (Prometheus)
+* **Alert-Deduplizierung per Fingerprint**
+* **TTL-basierte Suppression** (memory oder Redis)
+* **Rocket.Chat Incoming Webhook Support**
+* **Prometheus/Alertmanager kompatibel**
+* **Prometheus Metrics Endpoint** (`/metrics`)
+* **Einfaches Deployment in Kubernetes**
+* **Ultra leichtgewichtig** (Go Binary < 15 MB)
+* **Kein zentraler Alertmanager notwendig**
 
 ---
 
-## 📐 Architektur
+## 🧠 Architektur
 
-Alertmanager RZ1 ───► Rocketguard ──► Rocket.Chat
+```
+Alertmanager RZ1 ───►
+                  Rocketguard ───► Rocket.Chat
 Alertmanager RZ2 ───►
+```
 
+Rocketguard:
 
-Rocketguard kontrolliert:
-
-- ob ein Alert bereits kürzlich empfangen wurde
-- und unterdrückt ihn falls identisch
-
-Kein LoadBalancer oder Mesh erforderlich.
+1. Empfängt Alerts von beliebig vielen Alertmanager-Instanzen
+2. Erzeugt pro Alert ein Fingerprint
+3. Checkt im Cache (TTL-basiert), ob dieser Alert bereits verarbeitet wurde
+4. Leitet nur neue Alerts an Rocket.Chat weiter
 
 ---
 
-## 🚀 Getting Started
+## 🔧 Konfiguration
 
-### 1. Docker
+Rocketguard wird vollständig über Umgebungsvariablen konfiguriert.
+
+### Environment Variablen
+
+| Name                 | Default      | Beschreibung                     |
+| -------------------- | ------------ | -------------------------------- |
+| `ROCKET_WEBHOOK_URL` | **required** | Rocket.Chat Incoming Webhook URL |
+| `DEDUP_TTL_SECONDS`  | `300`        | TTL für identische Alerts        |
+| `REDIS_URL`          | empty        | Redis URL (optional)             |
+| `LOG_LEVEL`          | `info`       | debug / info / warn / error      |
+
+---
+
+## 📦 Installation
+
+### Docker
 
 ```bash
 docker run -p 8080:8080 \
-  -e ROCKET_WEBHOOK_URL="https://chat.company/hooks/123" \
+  -e ROCKET_WEBHOOK_URL="https://rocket.chat/hooks/123" \
   ghcr.io/your-org/rocketguard:latest
 ```
-### 2. Kubernetes (minimal)
 
+### Kubernetes
+
+```bash
 kubectl apply -f deploy/k8s/
+```
 
-### 3. Alertmanager Receiver
+### Alertmanager Receiver
 
+```yaml
 receivers:
-  - name: rocketchat
+  - name: rocketguard
     webhook_configs:
       - url: http://rocketguard.monitoring.svc.cluster.local:8080/alert
+```
 
-⚙️ Environment Variables
+---
 
-| Variable             | Default      | Description                                      |
-| -------------------- | ------------ | ------------------------------------------------ |
-| `ROCKET_WEBHOOK_URL` | **required** | Rocket.Chat Incoming Webhook                     |
-| `DEDUP_TTL_SECONDS`  | `300`        | global TTL für Dedupe Cache                      |
-| `REDIS_URL`          | empty        | optional Redis (`redis://user:pass@host:6379/0`) |
-| `LOG_LEVEL`          | `info`       | debug / info / warn / error                      |
+## 🧬 Fingerprinting
 
-📊 Metrics (Prometheus)
+Rocketguard erzeugt ein Fingerprint aus:
 
-Rocketguard exposes:
+* `alertname`
+* `instance`
+* `job`
+* `severity`
+* *optional*: Labels nach Wunsch
 
-rocketguard_dedup_hits_total
+Dieses Fingerprint steuert die Deduplizierung.
 
-rocketguard_dedup_misses_total
+### Beispiel
 
-rocketguard_cache_type
+```
+ERROR: service_down{job="api",instance="pod-1"}
+```
 
-rocketguard_alerts_forwarded_total
+→ Fingerprint: `hash("service_down|api|pod-1|critical")`
 
-Endpoint: /metrics
+---
 
-🔒 Security
+## 📊 Metrics
 
-Runs as non-root
+Rocketguard stellt einen Prometheus-Metrics Endpoint bereit.
 
-Optional NetworkPolicy
+Verfügbare Metriken:
 
-Limited RBAC
+* `rocketguard_dedup_hits_total`
+* `rocketguard_dedup_misses_total`
+* `rocketguard_alerts_forwarded_total`
+* `rocketguard_cache_backend`
 
-No persistent data (unless Redis used)
+Abrufbar unter:
 
-🧪 Test
+```
+/metrics
+```
 
+---
+
+## 📁 Projektstruktur
+
+```
+rocketguard/
+├─ cmd/rocketguard/main.go
+├─ deploy/k8s/
+├─ Dockerfile
+└─ README.md
+```
+
+---
+
+## 🛡️ Sicherheit
+
+* läuft als non-root
+* minimaler Attack Surface
+* optional: NetworkPolicies
+* optional: Redis-Auth
+
+---
+
+## 🧪 Testing
+
+### Beispiel Request
+
+```bash
 curl -X POST http://localhost:8080/alert \
   -H "Content-Type: application/json" \
-  -d @examples/rocket-webhook.json
+  -d @examples/alert.json
+```
 
-📜 License
+---
+
+## 🧭 Roadmap
+
+* [ ] Rate Limiting für massiven Alert-Output
+* [ ] Multi-Receiver Support (Slack, Teams)
+* [ ] UI für Dedupe-Cache
+* [ ] Persistent Cache für Wartungsfenster
+
+---
+
+## 📜 Lizenz
 
 MIT
 
 ---
 
-# 🏷️ **Kubernetes Deployment Labeling (Best Practices)**
+## ❤️ Support
 
-Ich verwende die **recommended labels** (Kubernetes SIG Apps):
-
-```yaml
-metadata:
-  name: rocketguard
-  labels:
-    app.kubernetes.io/name: rocketguard
-    app.kubernetes.io/instance: rocketguard
-    app.kubernetes.io/version: "1.0.0"
-    app.kubernetes.io/component: dedupe-proxy
-    app.kubernetes.io/part-of: monitoring
-    app.kubernetes.io/managed-by: fluxcd
-    app.kubernetes.io/created-by: rocketguard
-```
-Und zusätzlich (Monitoring-/SRE-tauglich):
-```
-    observability.role: alert-dedupe
-    security-context: restricted
-    cluster-layer: application
-```
-Diese Label sind suchbar, sortierbar, eindeutig und industrieweit akzeptiert.
+Fragen? Ideen? Bock auf ein Feature?
+Einfach melden – oder ein PR öffnen!
