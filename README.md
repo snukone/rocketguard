@@ -1,6 +1,6 @@
-# AntiEcho – Alert Dedupe Proxy for Alertmanager → Rocket.Chat
+# Rocketguard – Alert Dedupe Proxy for Alertmanager → Rocket.Chat
 
-AntiEcho ist ein hochperformanter, minimaler Alert-Dedupe-Proxy für
+Rocketguard ist ein hochperformanter, minimaler Alert-Dedupe-Proxy für
 Multi-Cluster-Umgebungen, in denen mehrere Alertmanager dieselben Alerts senden.
 Der Proxy verhindert Doppelmeldungen durch Fingerprinting & TTL-Cache
 (in-memory oder Redis).
@@ -28,11 +28,11 @@ Ideal für Umgebungen ohne zentralen Alertmanager, z. B.:
 
 ## 📐 Architektur
 
-Alertmanager RZ1 ───► AntiEcho ──► Rocket.Chat
+Alertmanager RZ1 ───► Rocketguard ──► Rocket.Chat
 Alertmanager RZ2 ───►
 
 
-AntiEcho kontrolliert:
+Rocketguard kontrolliert:
 
 - ob ein Alert bereits kürzlich empfangen wurde
 - und unterdrückt ihn falls identisch
@@ -48,8 +48,8 @@ Kein LoadBalancer oder Mesh erforderlich.
 ```bash
 docker run -p 8080:8080 \
   -e ROCKET_WEBHOOK_URL="https://chat.company/hooks/123" \
-  ghcr.io/your-org/antiecho:latest
-
+  ghcr.io/your-org/rocketguard:latest
+```
 ### 2. Kubernetes (minimal)
 
 kubectl apply -f deploy/k8s/
@@ -59,7 +59,7 @@ kubectl apply -f deploy/k8s/
 receivers:
   - name: rocketchat
     webhook_configs:
-      - url: http://antiecho.monitoring.svc.cluster.local:8080/alert
+      - url: http://rocketguard.monitoring.svc.cluster.local:8080/alert
 
 ⚙️ Environment Variables
 
@@ -72,15 +72,15 @@ receivers:
 
 📊 Metrics (Prometheus)
 
-AntiEcho exposes:
+Rocketguard exposes:
 
-antiecho_dedup_hits_total
+rocketguard_dedup_hits_total
 
-antiecho_dedup_misses_total
+rocketguard_dedup_misses_total
 
-antiecho_cache_type
+rocketguard_cache_type
 
-antiecho_alerts_forwarded_total
+rocketguard_alerts_forwarded_total
 
 Endpoint: /metrics
 
@@ -112,20 +112,20 @@ Ich verwende die **recommended labels** (Kubernetes SIG Apps):
 
 ```yaml
 metadata:
-  name: antiecho
+  name: rocketguard
   labels:
-    app.kubernetes.io/name: antiecho
-    app.kubernetes.io/instance: antiecho
+    app.kubernetes.io/name: rocketguard
+    app.kubernetes.io/instance: rocketguard
     app.kubernetes.io/version: "1.0.0"
     app.kubernetes.io/component: dedupe-proxy
     app.kubernetes.io/part-of: monitoring
     app.kubernetes.io/managed-by: fluxcd
-    app.kubernetes.io/created-by: antiecho
-
+    app.kubernetes.io/created-by: rocketguard
+```
 Und zusätzlich (Monitoring-/SRE-tauglich):
-
+```
     observability.role: alert-dedupe
     security-context: restricted
     cluster-layer: application
-
+```
 Diese Label sind suchbar, sortierbar, eindeutig und industrieweit akzeptiert.
