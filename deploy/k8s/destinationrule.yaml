@@ -1,0 +1,32 @@
+# Voraussetzungen, damit das funktioniert
+
+# Locality-Informationen müssen korrekt gesetzt sein
+# In beiden Clustern müssen die Nodes folgendes setzen:
+
+# topology.istio.io/region=region
+# topology.istio.io/zone=rz1 oder rz2
+
+
+# Istio Multi-cluster mesh muss richtig synchronisiert sein
+# (--meshConfig.defaultConfig.proxyMetadata.ISTIO_META_DNS_CAPTURE=“true” ist meist bereits gesetzt)
+
+# Der Service muss im Mesh in beiden Clustern bekannt, aber nur in RZ1 deployed sein.
+
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: my-service
+  namespace: default
+spec:
+  host: my-service.default.svc.cluster.local
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xx: 1
+      interval: 1s
+      baseEjectionTime: 2m
+    loadBalancer:
+      localityLbSetting:
+        enabled: true
+        failover:
+          - from: region/rz2
+            to: region/rz1

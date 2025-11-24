@@ -9,3 +9,4 @@ spec:
     - route:
         - destination:
             host: rocketguard.default.svc.cluster.local
+          weight: 100
