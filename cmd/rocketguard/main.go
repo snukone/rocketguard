@@ -96,8 +96,8 @@ func parseTTL() time.Duration {
 }
 
 func initCache(ctx context.Context) {
-	tl := parseTTL()
-	dedupTTL = int(tt.Seconds())
+	ttl := parseTTL()
+	dedupTTL = int(ttl.Seconds())
 
 	if redisURLEnv != "" {
 		opt, err := redis.ParseURL(redisURLEnv)
@@ -110,15 +110,15 @@ func initCache(ctx context.Context) {
 		}
 		useRedis = true
 		cacheType.Set(1)
-		log.Printf("Using Redis cache, TTL=%ds", int(tt.Seconds()))
+		log.Printf("Using Redis cache, TTL=%ds", int(ttl.Seconds()))
 		return
 	}
 
 	// in-memory cache
-	memCache = cache.New(tt, 1*time.Minute)
+	memCache = cache.New(ttl, 1*time.Minute)
 	useRedis = false
 	cacheType.Set(0)
-	log.Printf("Using in-memory cache (not shared), TTL=%ds", int(tt.Seconds()))
+	log.Printf("Using in-memory cache (not shared), TTL=%ds", int(ttl.Seconds()))
 }
 
 func fingerprint(a *Alert) string {
@@ -342,4 +342,24 @@ func main() {
 	addr := ":" + portEnv
 	log.Printf("rocketguard starting on %s (TTL=%ds)", addr, dedupTTL)
 	if err := http.ListenAndServe(addr, nil); err != nil { log.Fatalf("server failed: %v", err) }
+}
+
+// Test helpers for unit tests
+
+
+// InitInMemoryCacheForTests initialises the in-memory cache for tests with the given TTL in seconds.
+// Call this from tests to prepare the cache environment.
+func InitInMemoryCacheForTests(ttlSeconds int) {
+memCache = cache.New(time.Duration(ttlSeconds)*time.Second, 1*time.Second)
+useRedis = false
+dedupTTL = ttlSeconds
+}
+
+
+// ResetCache clears cache and redis client for clean test setup.
+func ResetCache() {
+memCache = nil
+rdb = nil
+useRedis = false
+dedupTTL = 0
 }
