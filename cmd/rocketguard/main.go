@@ -33,9 +33,10 @@ var (
 	portEnv             = envOr("PORT", "8080")
 	dedupTTLEnv         = envOr("DEDUP_TTL_SECONDS", "600")
 	forwardTimeoutMsEnv = envOr("FORWARD_TIMEOUT_MS", "5000")
-	redisURLEnv         = os.Getenv("REDIS_URL")
 	receiverMapPath     = envOr("RECEIVER_MAP_PATH", "/config/receivers.yaml")
 	fallbackReceiver    = envOr("FALLBACK_RECEIVER", "")
+	logLevelEnv         = envOr("LOG_LEVEL", "info")
+	redisURLEnv         = os.Getenv("REDIS_URL")
 )
 
 // Prometheus metrics
@@ -96,8 +97,8 @@ func parseTTL() time.Duration {
 }
 
 func initCache(ctx context.Context) {
-	tl := parseTTL()
-	dedupTTL = int(tt.Seconds())
+	ttl := parseTTL()
+	dedupTTL = int(ttl.Seconds())
 
 	if redisURLEnv != "" {
 		opt, err := redis.ParseURL(redisURLEnv)
@@ -110,14 +111,14 @@ func initCache(ctx context.Context) {
 		}
 		useRedis = true
 		cacheType.Set(1)
-		log.Printf("Using Redis cache, TTL=%ds", int(tt.Seconds()))
+		log.Printf("Using Redis cache, TTL=%ds", int(ttl.Seconds()))
 		return
 	}
 
-	memCache = cache.New(tt, 1*time.Minute)
+	memCache = cache.New(ttl, 1*time.Minute)
 	useRedis = false
 	cacheType.Set(0)
-	log.Printf("Using in-memory cache (not shared), TTL=%ds", int(tt.Seconds()))
+	log.Printf("Using in-memory cache (not shared), TTL=%ds", int(ttl.Seconds()))
 }
 
 func fingerprint(a *Alert) string {
@@ -213,18 +214,34 @@ func getTargetsForReceiver(receiver string) ([]string, error) {
 func forwardToTargets(raw []byte, targets []string) error {
 	var lastErr error
 	for _, t := range targets {
+		if logLevelEnv == "debug" {
+            log.Printf("forwarding to %s with raw body:\n%s", t, string(raw))
+        }
 		req, err := http.NewRequest(http.MethodPost, t, strings.NewReader(string(raw)))
-		if err != nil { lastErr = err; continue }
+		if err != nil { 
+			lastErr = err; 
+			if logLevelEnv == "debug" {
+				log.Printf("failed to create request for %s: %w", t, err);
+			}
+			continue
+		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := httpCli.Do(req)
-		if err != nil { lastErr = err; continue }
+		if err != nil { 
+			lastErr = err;
+			if logLevelEnv == "debug" {
+				log.Printf("forward request to %s failed: %w", t, err);
+			}
+			continue
+		}
 		io.Copy(ioutil.Discard, resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			// success for this target
 			return nil
 		}
-		lastErr = fmt.Errorf("bad status %d from %s", resp.StatusCode, t)
+		lastErr = fmt.Errorf("forward target %s returned %d: %s", t, resp.StatusCode, string(body))
 	}
 	return lastErr
 }
@@ -289,6 +306,10 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		log.Printf("marshal out error: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+
+	if logLevelEnv == "debug" {
+		log.Printf("forwarding minimized alert payload:\n%s", string(outBytes))
 	}
 
 	if err := forwardToTargets(outBytes, targets); err != nil {
