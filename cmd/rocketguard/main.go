@@ -211,26 +211,57 @@ func getTargetsForReceiver(receiver string) ([]string, error) {
 }
 
 func buildRocketPayload(alerts []Alert) map[string]interface{} {
-	lines := make([]string, 0, len(alerts))
-	for _, a := range alerts {
-		l := a.Labels
-		ann := a.Annotations
-		sev := l["severity"]
-		if sev == "" { sev = ann["severity"] }
-		title := l["alertname"]
-		if title == "" { title = ann["summary"] }
-		job := ""
-		if j := l["job"]; j != "" { job = fmt.Sprintf(" job=%s", j) }
-		site := ""
-		if s := l["site"]; s != "" { site = fmt.Sprintf(" site=%s", s) }
-		inst := ""
-		if i := l["instance"]; i != "" { inst = fmt.Sprintf(" instance=%s", i) }
-		desc := ann["description"]
-		if desc == "" { desc = ann["summary"] }
-		lines = append(lines, fmt.Sprintf("*%s* (%s)%s%s%s\n%s", title, sev, job, site, inst, desc))
-	}
-	return map[string]interface{}{"text": strings.Join(lines, "\n\n")}
+    attachments := []map[string]interface{}{}
+
+    for _, a := range alerts {
+        // sanitize color (Rocket.Chat needs hex without #)
+        color := strings.TrimPrefix(a.Labels["severity_color"], "#")
+        if color == "" {
+            color = "ff0000"
+        }
+
+        fields := []map[string]string{}
+        for k, v := range a.Labels {
+            if k == "severity_color" {
+                continue
+            }
+            fields = append(fields, map[string]string{
+                "title": sanitize(k),
+                "value": sanitize(v),
+            })
+        }
+        for k, v := range a.Annotations {
+            fields = append(fields, map[string]string{
+                "title": sanitize(k),
+                "value": sanitize(v),
+            })
+        }
+
+        text := sanitize(a.Annotations["description"])
+        if text == "" {
+            text = fmt.Sprintf("%s firing", a.Labels["alertname"])
+        }
+
+        attachment := map[string]interface{}{
+            "title": a.Labels["alertname"],
+            "text":  text,
+            "color": color,
+            "fields": fields,
+        }
+
+        attachments = append(attachments, attachment)
+    }
+
+    return map[string]interface{}{
+        "text":        "Prometheus Alert",
+        "attachments": attachments,
+    }
 }
+
+func sanitize(s string) string {
+    return strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\"", "'")
+}
+
 
 // fan-out forward to all targets for receiver; returns error if all fail
 func forwardToTargets(payload map[string]interface{}, targets []string) error {
