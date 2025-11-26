@@ -96,8 +96,8 @@ func parseTTL() time.Duration {
 }
 
 func initCache(ctx context.Context) {
-	ttl := parseTTL()
-	dedupTTL = int(ttl.Seconds())
+	tl := parseTTL()
+	dedupTTL = int(tt.Seconds())
 
 	if redisURLEnv != "" {
 		opt, err := redis.ParseURL(redisURLEnv)
@@ -110,15 +110,14 @@ func initCache(ctx context.Context) {
 		}
 		useRedis = true
 		cacheType.Set(1)
-		log.Printf("Using Redis cache, TTL=%ds", int(ttl.Seconds()))
+		log.Printf("Using Redis cache, TTL=%ds", int(tt.Seconds()))
 		return
 	}
 
-	// in-memory cache
-	memCache = cache.New(ttl, 1*time.Minute)
+	memCache = cache.New(tt, 1*time.Minute)
 	useRedis = false
 	cacheType.Set(0)
-	log.Printf("Using in-memory cache (not shared), TTL=%ds", int(ttl.Seconds()))
+	log.Printf("Using in-memory cache (not shared), TTL=%ds", int(tt.Seconds()))
 }
 
 func fingerprint(a *Alert) string {
@@ -210,65 +209,11 @@ func getTargetsForReceiver(receiver string) ([]string, error) {
 	return nil, fmt.Errorf("no targets for receiver %s", receiver)
 }
 
-func buildRocketPayload(alerts []Alert) map[string]interface{} {
-    attachments := []map[string]interface{}{}
-
-    for _, a := range alerts {
-        // sanitize color (Rocket.Chat needs hex without #)
-        color := strings.TrimPrefix(a.Labels["severity_color"], "#")
-        if color == "" {
-            color = "ff0000"
-        }
-
-        fields := []map[string]string{}
-        for k, v := range a.Labels {
-            if k == "severity_color" {
-                continue
-            }
-            fields = append(fields, map[string]string{
-                "title": sanitize(k),
-                "value": sanitize(v),
-            })
-        }
-        for k, v := range a.Annotations {
-            fields = append(fields, map[string]string{
-                "title": sanitize(k),
-                "value": sanitize(v),
-            })
-        }
-
-        text := sanitize(a.Annotations["description"])
-        if text == "" {
-            text = fmt.Sprintf("%s firing", a.Labels["alertname"])
-        }
-
-        attachment := map[string]interface{}{
-            "title": a.Labels["alertname"],
-            "text":  text,
-            "color": color,
-            "fields": fields,
-        }
-
-        attachments = append(attachments, attachment)
-    }
-
-    return map[string]interface{}{
-        "text":        "Prometheus Alert",
-        "attachments": attachments,
-    }
-}
-
-func sanitize(s string) string {
-    return strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\"", "'")
-}
-
-
-// fan-out forward to all targets for receiver; returns error if all fail
-func forwardToTargets(payload map[string]interface{}, targets []string) error {
-	b, _ := json.Marshal(payload)
+// fan-out forward raw bytes (Alertmanager JSON) to all targets for receiver; returns error if all fail
+func forwardToTargets(raw []byte, targets []string) error {
 	var lastErr error
 	for _, t := range targets {
-		req, err := http.NewRequest(http.MethodPost, t, strings.NewReader(string(b)))
+		req, err := http.NewRequest(http.MethodPost, t, strings.NewReader(string(raw)))
 		if err != nil { lastErr = err; continue }
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := httpCli.Do(req)
@@ -286,12 +231,26 @@ func forwardToTargets(payload map[string]interface{}, targets []string) error {
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { http.Error(w, "only POST", http.StatusMethodNotAllowed); return }
-	var payload AMPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil { http.Error(w, "invalid json", http.StatusBadRequest); return }
-	alerts := payload.Alerts
+
+	// read raw body bytes so we can forward a preserved Alertmanager payload
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+
+	var orig AMPayload
+	if err := json.Unmarshal(bodyBytes, &orig); err != nil {
+		// if we can't parse the Alertmanager JSON, still try to forward raw (fail-fast)
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	alerts := orig.Alerts
 	if len(alerts) == 0 { w.WriteHeader(200); w.Write([]byte(`{"status":"no_alerts"}`)); return }
 
-	receiver := payload.Receiver
+	// determine targets based on receiver field
+	receiver := orig.Receiver
 	targets, err := getTargetsForReceiver(receiver)
 	if err != nil {
 		log.Printf("no targets for receiver %s: %v", receiver, err)
@@ -322,8 +281,17 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payloadOut := buildRocketPayload(toForward)
-	if err := forwardToTargets(payloadOut, targets); err != nil {
+	// build an Alertmanager-style payload that contains only the forwarded alerts
+	out := orig
+	out.Alerts = toForward
+	outBytes, err := json.Marshal(out)
+	if err != nil {
+		log.Printf("marshal out error: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := forwardToTargets(outBytes, targets); err != nil {
 		forwardErr.Inc()
 		log.Printf("forward failed: %v", err)
 		http.Error(w, "forward_error", http.StatusBadGateway)
@@ -375,22 +343,21 @@ func main() {
 	if err := http.ListenAndServe(addr, nil); err != nil { log.Fatalf("server failed: %v", err) }
 }
 
-// Test helpers for unit tests
 
+// Test helpers for unit tests
 
 // InitInMemoryCacheForTests initialises the in-memory cache for tests with the given TTL in seconds.
 // Call this from tests to prepare the cache environment.
 func InitInMemoryCacheForTests(ttlSeconds int) {
-memCache = cache.New(time.Duration(ttlSeconds)*time.Second, 1*time.Second)
-useRedis = false
-dedupTTL = ttlSeconds
+	memCache = cache.New(time.Duration(ttlSeconds)*time.Second, 1*time.Second)
+	useRedis = false
+	dedupTTL = ttlSeconds
 }
-
 
 // ResetCache clears cache and redis client for clean test setup.
 func ResetCache() {
-memCache = nil
-rdb = nil
-useRedis = false
-dedupTTL = 0
+	memCache = nil
+	rdb = nil
+	useRedis = false
+	dedupTTL = 0
 }
