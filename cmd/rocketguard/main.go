@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -211,17 +212,17 @@ func getTargetsForReceiver(receiver string) ([]string, error) {
 }
 
 // fan-out forward raw bytes (Alertmanager JSON) to all targets for receiver; returns error if all fail
-func forwardToTargets(raw []byte, targets []string) error {
+func forwardToTargets(raw []byte, targets []string, logPrefix string) error {
 	var lastErr error
 	for _, t := range targets {
 		if logLevelEnv == "debug" {
-            log.Printf("forwarding to %s with raw body:\n%s", t, string(raw))
+            log.Printf(logPrefix+"forwarding to %s with raw body:\n%s", t, string(raw))
         }
 		req, err := http.NewRequest(http.MethodPost, t, strings.NewReader(string(raw)))
 		if err != nil { 
 			lastErr = err; 
 			if logLevelEnv == "debug" {
-				log.Printf("failed to create request for %s: %w", t, err);
+				log.Printf(logPrefix+"failed to create request for %s: %w", t, err);
 			}
 			continue
 		}
@@ -230,7 +231,7 @@ func forwardToTargets(raw []byte, targets []string) error {
 		if err != nil { 
 			lastErr = err;
 			if logLevelEnv == "debug" {
-				log.Printf("forward request to %s failed: %w", t, err);
+				log.Printf(logPrefix+"forward request to %s failed: %w", t, err);
 			}
 			continue
 		}
@@ -241,12 +242,15 @@ func forwardToTargets(raw []byte, targets []string) error {
 			// success for this target
 			return nil
 		}
-		lastErr = fmt.Errorf("forward target %s returned %d: %s", t, resp.StatusCode, string(body))
+		lastErr = fmt.Errorf(logPrefix+"forward target %s returned %d: %s", t, resp.StatusCode, string(body))
 	}
 	return lastErr
 }
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	correlationID := getOrCreateCorrelationID(r)
+    logPrefix := fmt.Sprintf("[cid=%s] ", correlationID)
+
 	if r.Method != http.MethodPost { http.Error(w, "only POST", http.StatusMethodNotAllowed); return }
 
 	// read raw body bytes so we can forward a preserved Alertmanager payload
@@ -270,7 +274,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	receiver := orig.Receiver
 	targets, err := getTargetsForReceiver(receiver)
 	if err != nil {
-		log.Printf("no targets for receiver %s: %v", receiver, err)
+		log.Printf(logPrefix+"no targets for receiver %s: %v", receiver, err)
 		http.Error(w, "no target for receiver", http.StatusBadRequest)
 		return
 	}
@@ -284,7 +288,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		ok, err := setIfNotExists(ctx, key, dedupTTL)
 		if err != nil {
 			// fail-open
-			log.Printf("cache error, fail-open: %v", err)
+			log.Printf(logPrefix+"cache error, fail-open: %v", err)
 			toForward = append(toForward, *a)
 			continue
 		}
@@ -303,18 +307,18 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	out.Alerts = toForward
 	outBytes, err := json.Marshal(out)
 	if err != nil {
-		log.Printf("marshal out error: %v", err)
+		log.Printf(logPrefix+"marshal out error: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	if logLevelEnv == "debug" {
-		log.Printf("forwarding minimized alert payload:\n%s", string(outBytes))
+		log.Printf(logPrefix+"forwarding minimized alert payload:\n%s", string(outBytes))
 	}
 
-	if err := forwardToTargets(outBytes, targets); err != nil {
+	if err := forwardToTargets(outBytes, targets, logPrefix); err != nil {
 		forwardErr.Inc()
-		log.Printf("forward failed: %v", err)
+		log.Printf(logPrefix+"forward failed: %v", err)
 		http.Error(w, "forward_error", http.StatusBadGateway)
 		return
 	}
@@ -364,6 +368,16 @@ func main() {
 	if err := http.ListenAndServe(addr, nil); err != nil { log.Fatalf("server failed: %v", err) }
 }
 
+func getOrCreateCorrelationID(r *http.Request) string {
+    cid := r.Header.Get("X-Correlation-ID")
+    if cid != "" {
+        return cid
+    }
+    // fallback — kurze random ID
+    b := make([]byte, 8)
+    _, _ = rand.Read(b)
+    return fmt.Sprintf("%x", b)
+}
 
 // Test helpers for unit tests
 
