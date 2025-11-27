@@ -235,9 +235,9 @@ func forwardToTargets(raw []byte, targets []string, logPrefix string) error {
 			}
 			continue
 		}
-		io.Copy(ioutil.Discard, resp.Body)
+		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			// success for this target
 			return nil
