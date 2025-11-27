@@ -208,7 +208,7 @@ func getTargetsForReceiver(receiver string) ([]string, error) {
 			return targets, nil
 		}
 	}
-	return nil, fmt.Errorf("no targets for receiver %s", receiver)
+	return nil, fmt.Errorf("no target for receiver %s", receiver)
 }
 
 // fan-out forward raw bytes (Alertmanager JSON) to all targets for receiver; returns error if all fail
@@ -274,7 +274,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	receiver := orig.Receiver
 	targets, err := getTargetsForReceiver(receiver)
 	if err != nil {
-		log.Printf(logPrefix+"no targets for receiver %s: %v", receiver, err)
+		log.Printf(logPrefix+"%v", err)
 		http.Error(w, "no target for receiver", http.StatusBadRequest)
 		return
 	}
@@ -310,10 +310,6 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		log.Printf(logPrefix+"marshal out error: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
-	}
-
-	if logLevelEnv == "debug" {
-		log.Printf(logPrefix+"forwarding minimized alert payload:\n%s", string(outBytes))
 	}
 
 	if err := forwardToTargets(outBytes, targets, logPrefix); err != nil {
